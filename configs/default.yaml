@@ -1,0 +1,62 @@
+data:
+  train_aria_dir:   /scr/cezhao/workspace/HOI_recon/_DATA/hot3d/train_aria
+  train_quest3_dir: /scr/cezhao/workspace/HOI_recon/_DATA/hot3d/train_quest3
+  test_aria_dir:    /scr/cezhao/workspace/HOI_recon/_DATA/hot3d/test_aria
+  test_quest3_dir:  /scr/cezhao/workspace/HOI_recon/_DATA/hot3d/test_quest3
+  object_models_dir: /scr/cezhao/workspace/HOI_recon/_DATA/hot3d/object_models
+  mano_npz_dir:     /scr/cezhao/workspace/HOI_recon/_DATA/mano
+  window_len:  120      # frames per training window (T)
+  stride:       30      # sliding window stride within one 150-frame clip
+  load_images:  true
+
+model:
+  # Diffusion variable dimension: 9 (obj) + 2 (contact) + 31*2 (hands) = 73
+  x_dim:        73
+  # Noisy hand conditioning dimension: 31*2 = 62
+  h_dim:        62
+  # BPS descriptor dimension for object template
+  bps_n_points: 1024
+  bps_radius:   0.2     # unit sphere radius scaled to ~hand size
+  # Transformer denoiser
+  d_model:      512
+  nhead:        4
+  d_ff:         2048    # feedforward hidden dim (paper target ~12.35M params)
+  num_layers:   4
+  dropout:      0.1
+  # Ambient Sensor: hand-to-object nearest-point displacements
+  n_hand_joints: 21
+  use_ambient_sensor: true
+
+diffusion:
+  n_steps:      1000    # total diffusion steps N
+  schedule:     cosine  # noise schedule: cosine | linear
+  beta_min:     1.0e-4  # used only for linear schedule
+  beta_max:     0.02
+
+training:
+  batch_size:     32
+  num_workers:    8
+  lr:             2.0e-4
+  optimizer:      adamw
+  weight_decay:   1.0e-4
+  max_iters:      1_000_000
+  warmup_iters:   1_000
+  # Curriculum: add auxiliary losses after this many steps
+  aux_loss_start: 10_000
+  # Loss weights
+  lambda_inter:   1.0
+  lambda_const:   1.0
+  lambda_smooth:  0.1
+  # Checkpointing
+  save_every:     10_000
+  val_every:      5_000
+  log_every:      100
+  out_dir:        /scr/cezhao/workspace/HOI_recon/_DATA/checkpoints/whole
+
+inference:
+  # Classifier guidance weight
+  guidance_weight: 1.0
+  # Reprojection subsample rate (VLM contact at 3fps out of 30fps clips)
+  contact_fps:    3
+  # Sliding window overlap for long sequences
+  window_overlap: 30

@@ -7,8 +7,7 @@ __pycache__/
 dist/
 build/
 
-# 数据（存在 _DATA/ 目录，不纳入 git）
-data/
+# Data files (stored in _DATA/, not in repo)
 *.tar
 *.zip
 *.hdf5
