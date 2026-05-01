@@ -133,12 +133,12 @@ class TestDiffusionVariable:
         x0 = build_diffusion_variable(w)
         assert x0.dtype == np.float32
 
-    def test_contact_zeros(self, window):
-        """Contact labels should be zero (filled by VLM later)."""
-        w = gravity_align_window(window.copy())
+    def test_contact_binary(self, window):
+        """Contact labels should be binary {0, 1} from proximity threshold."""
+        w  = gravity_align_window(window.copy())
         x0 = build_diffusion_variable(w)
-        np.testing.assert_array_equal(x0[:, 9:11], 0.0,
-                                      err_msg='Contact dims should be 0')
+        c  = x0[:, 9:11]
+        assert ((c == 0) | (c == 1)).all(), 'Contact labels must be binary'
 
     def test_obj_9d_is_valid_rotation(self, window):
         """The 9D object representation should decode to a valid rotation."""
