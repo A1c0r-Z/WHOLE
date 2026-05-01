@@ -97,33 +97,37 @@ def pca_to_axis_angle(thetas: np.ndarray, side: str = 'right') -> np.ndarray:
 # MANO forward kinematics via smplx MANOLayer
 # ---------------------------------------------------------------------------
 
-def get_mano_layer(side: str, pkl_path: Optional[str | Path] = None) -> Optional[object]:
-    """Return a cached smplx MANOLayer.
+MANO_FINGERTIP_VERT_INDICES = [744, 320, 443, 554, 671]  # thumb, index, middle, ring, pinky
 
-    Uses the pkl file when available (in an env with chumpy).
-    Returns None if smplx cannot be loaded, so callers fall back gracefully.
+
+def get_mano_layer(side: str, pkl_path: Optional[str | Path] = None) -> Optional[object]:
+    """Return a cached smplx MANO model.
+
+    Uses smplx.create (MANO class) which correctly handles PCA expansion across
+    smplx versions.  Returns None if the pkl cannot be loaded (no chumpy).
     """
     if side in _MANO_LAYERS:
         return _MANO_LAYERS[side]
 
     if pkl_path is None:
-        # Default pkl path used by hamer
         pkl_path = (Path('/scr/cezhao/workspace/HOI_recon/hamer/_DATA/data/mano')
                     / f'MANO_{side.upper()}.pkl')
 
     try:
         import smplx
-        layer = smplx.MANOLayer(
+        layer = smplx.create(
             str(pkl_path),
+            model_type='mano',
             use_pca=True,
             num_pca_comps=15,
             is_rhand=(side == 'right'),
             flat_hand_mean=True,
+            batch_size=1,   # smplx.create needs batch_size; overridden at forward time
         )
         layer.eval()
         _MANO_LAYERS[side] = layer
     except Exception as e:
-        warnings.warn(f'Could not load smplx MANOLayer for {side}: {e}. FK disabled.')
+        warnings.warn(f'Could not load smplx MANO for {side}: {e}. FK disabled.')
         _MANO_LAYERS[side] = None
 
     return _MANO_LAYERS[side]
@@ -165,6 +169,8 @@ def mano_forward(
     all_joints:   list[np.ndarray] = []
     all_vertices: list[np.ndarray] = []
 
+    fingertip_idx = torch.tensor(MANO_FINGERTIP_VERT_INDICES, dtype=torch.long)
+
     for s in range(0, T, batch_size):
         e   = min(s + batch_size, T)
         B   = e - s
@@ -175,12 +181,16 @@ def mano_forward(
             betas         = b.unsqueeze(0).expand(B, -1),
             return_verts  = True,
         )
-        all_joints.append(out.joints.numpy())
-        all_vertices.append(out.vertices.numpy())
+        verts = out.vertices                         # (B, 778, 3)
+        # MANO native: 16 joints. Append 5 fingertip vertices to get 21.
+        tips  = verts[:, fingertip_idx, :]           # (B, 5, 3)
+        joints_21 = torch.cat([out.joints, tips], dim=1)  # (B, 21, 3)
+        all_joints.append(joints_21.numpy())
+        all_vertices.append(verts.numpy())
 
     return {
-        'joints':   np.concatenate(all_joints,   axis=0),
-        'vertices': np.concatenate(all_vertices, axis=0),
+        'joints':   np.concatenate(all_joints,   axis=0),   # (T, 21, 3)
+        'vertices': np.concatenate(all_vertices, axis=0),   # (T, 778, 3)
     }
 
 

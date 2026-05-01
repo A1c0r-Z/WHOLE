@@ -34,12 +34,14 @@ def convert_mano_pkl(pkl_path: Path, out_path: Path):
     is_rhand = 'RIGHT' in pkl_path.name.upper()
     print(f"  Loading {'right' if is_rhand else 'left'} hand: {pkl_path}")
 
-    layer = smplx.MANOLayer(
+    layer = smplx.create(
         str(pkl_path),
+        model_type='mano',
         use_pca=True,
         num_pca_comps=15,
         is_rhand=is_rhand,
         flat_hand_mean=True,
+        batch_size=1,
     )
 
     def _to_np(x):
