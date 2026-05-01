@@ -4,223 +4,195 @@ HOT3D stores hand pose as a 15D PCA-compressed representation:
     wrist_xform [6D]: axis-angle global orientation (3D) + world translation (3D)
     thetas      [15D]: PCA coefficients of the 45D MANO joint pose
 
-This module handles:
-  1. Loading the HOT3D PCA basis from the toolkit
-  2. Converting PCA thetas -> full 45D axis-angle joint poses
-  3. Building MANO input dicts compatible with the smplx library
-  4. Running MANO forward kinematics to obtain joint positions J
+PCA expansion:  full_pose (45D) = thetas (15D) @ hand_components (15, 45) + hand_mean (45,)
+
+The MANO .npz files are converted from the original .pkl files once via:
+    scripts/convert_mano_pkl.py  (requires hawor_h200 env with chumpy)
+and stored at MANO_NPZ_DIR as MANO_RIGHT.npz (and MANO_LEFT.npz when available).
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional
+import warnings
 
 import numpy as np
 import torch
 
 
-# HOT3D PCA basis for MANO hand pose.
-# The basis is a (45, 15) matrix: full_pose = basis @ thetas
-# Loaded lazily from the HOT3D toolkit package on first use.
-_PCA_BASIS: Optional[np.ndarray] = None
-_PCA_MEAN:  Optional[np.ndarray] = None
+MANO_NPZ_DIR = Path('/scr/cezhao/workspace/HOI_recon/_DATA/mano')
+
+# Cached MANO data per side: 'left' / 'right'
+_MANO_DATA: dict[str, dict] = {}
+# Cached smplx MANOLayer per side (used for FK when available)
+_MANO_LAYERS: dict[str, object] = {}
 
 
-def _load_pca_basis() -> tuple[np.ndarray, np.ndarray]:
-    """Load HOT3D's MANO PCA basis and mean pose.
+# ---------------------------------------------------------------------------
+# Loading MANO model data
+# ---------------------------------------------------------------------------
 
-    HOT3D reduces 45D MANO hand pose to 15D via PCA.  The basis lives inside
-    the `hot3d` Python package shipped with the dataset toolkit.  We try two
-    strategies:
-      1. Import directly from the installed hot3d package.
-      2. Fall back to a zero mean + identity-like stub so the rest of the
-         pipeline can run even without the official toolkit installed.
+def _load_mano_npz(side: str) -> dict:
+    """Load the MANO .npz for the given hand side.
 
-    Returns:
-        basis: (45, 15) numpy array
-        mean:  (45,)   numpy array
+    Falls back to a stub if the file is not found, so the rest of the
+    pipeline can run (with degraded FK accuracy).
     """
-    global _PCA_BASIS, _PCA_MEAN
+    if side in _MANO_DATA:
+        return _MANO_DATA[side]
 
-    if _PCA_BASIS is not None:
-        return _PCA_BASIS, _PCA_MEAN
+    npz_path = MANO_NPZ_DIR / f'MANO_{side.upper()}.npz'
+    if npz_path.exists():
+        data = dict(np.load(str(npz_path), allow_pickle=False))
+        _MANO_DATA[side] = data
+        return data
 
-    try:
-        # HOT3D toolkit stores PCA components inside its hand model module
-        from hot3d.data_loaders.HandModel import MANOHandModel  # type: ignore
-        model = MANOHandModel()
-        _PCA_BASIS = model.pose_pca_basis.numpy()   # (45, 15)
-        _PCA_MEAN  = model.pose_pca_mean.numpy()    # (45,)
-    except Exception:
-        # Fallback: treat thetas as the first 15 dims of the pose directly.
-        # This is only a placeholder — replace with actual basis when available.
-        import warnings
-        warnings.warn(
-            "HOT3D toolkit not found; using identity PCA basis stub. "
-            "Install the hot3d package for correct MANO reconstruction.",
-            stacklevel=2,
-        )
-        _PCA_BASIS = np.zeros((45, 15), dtype=np.float32)
-        _PCA_BASIS[:15, :15] = np.eye(15, dtype=np.float32)
-        _PCA_MEAN  = np.zeros(45, dtype=np.float32)
+    warnings.warn(
+        f'MANO_{"RIGHT" if side == "right" else "LEFT"}.npz not found at '
+        f'{npz_path}. Run scripts/convert_mano_pkl.py first. '
+        f'Using identity PCA stub — FK results will be incorrect.',
+        stacklevel=2,
+    )
+    stub = {
+        'hand_components': np.eye(15, 45, dtype=np.float32),
+        'hand_mean':       np.zeros(45,  dtype=np.float32),
+        'v_template':      np.zeros((778, 3),    dtype=np.float32),
+        'J_regressor':     np.zeros((16, 778),   dtype=np.float32),
+        'parents':         np.arange(16,          dtype=np.int64),
+        'lbs_weights':     np.zeros((778, 16),   dtype=np.float32),
+        'faces':           np.zeros((1538, 3),   dtype=np.int64),
+        'shapedirs':       np.zeros((778, 3, 10),dtype=np.float32),
+        'posedirs':        np.zeros((135, 2334), dtype=np.float32),
+    }
+    _MANO_DATA[side] = stub
+    return stub
 
-    return _PCA_BASIS, _PCA_MEAN
 
+# ---------------------------------------------------------------------------
+# PCA expansion
+# ---------------------------------------------------------------------------
 
-def pca_to_axis_angle(thetas: np.ndarray) -> np.ndarray:
+def pca_to_axis_angle(thetas: np.ndarray, side: str = 'right') -> np.ndarray:
     """Expand 15D PCA coefficients to full 45D MANO hand pose (axis-angle).
 
+    full_pose = thetas @ hand_components + hand_mean
+
     Args:
-        thetas: (..., 15) PCA coefficients
+        thetas: (..., 15) PCA coefficients from HOT3D hands.json
+        side:   'left' or 'right'
     Returns:
         (..., 45) axis-angle joint rotations (15 joints × 3)
     """
-    basis, mean = _load_pca_basis()              # (45, 15), (45,)
-    shape = thetas.shape[:-1]
-    flat  = thetas.reshape(-1, 15)               # (N, 15)
-    pose  = (flat @ basis.T) + mean              # (N, 45)
-    return pose.reshape(*shape, 45)
-
-
-def build_mano_input(
-    thetas:      np.ndarray,   # (T, 15)
-    wrist_xform: np.ndarray,   # (T, 6)
-    betas:       np.ndarray,   # (10,)
-) -> dict[str, np.ndarray]:
-    """Assemble a dict of MANO parameters from HOT3D's stored representation.
-
-    HOT3D wrist_xform layout:
-        [0:3]  axis-angle global orientation (world → wrist)
-        [3:6]  wrist translation in world frame
-
-    Args:
-        thetas:      (T, 15) PCA articulation coefficients
-        wrist_xform: (T, 6)  global orient + world translation
-        betas:       (10,)   shape parameters (constant per person)
-    Returns:
-        dict with keys: global_orient (T,3), hand_pose (T,45),
-                        transl (T,3), betas (10,)
-    """
-    T = thetas.shape[0]
-    hand_pose = pca_to_axis_angle(thetas)        # (T, 45)
-
-    return {
-        'global_orient': wrist_xform[:, :3],     # (T, 3)
-        'hand_pose':     hand_pose,              # (T, 45)
-        'transl':        wrist_xform[:, 3:],     # (T, 3)
-        'betas':         betas,                  # (10,)
-    }
+    data   = _load_mano_npz(side)
+    comps  = data['hand_components']   # (15, 45)
+    mean   = data['hand_mean']         # (45,)
+    shape  = thetas.shape[:-1]
+    flat   = thetas.reshape(-1, 15)    # (N, 15)
+    pose   = flat @ comps + mean       # (N, 45)
+    return pose.reshape(*shape, 45).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
-# MANO forward kinematics via smplx
+# MANO forward kinematics via smplx MANOLayer
 # ---------------------------------------------------------------------------
 
-_MANO_LAYERS: dict[str, object] = {}  # side -> smplx.MANO, cached
+def get_mano_layer(side: str, pkl_path: Optional[str | Path] = None) -> Optional[object]:
+    """Return a cached smplx MANOLayer.
 
-
-def get_mano_layer(side: str, model_path: str | Path) -> object:
-    """Return a cached smplx MANO layer for the given hand side.
-
-    Args:
-        side:       'left' or 'right'
-        model_path: Directory containing MANO_LEFT.pkl / MANO_RIGHT.pkl
-    Returns:
-        smplx.MANO model instance (eval mode, on CPU)
+    Uses the pkl file when available (in an env with chumpy).
+    Returns None if smplx cannot be loaded, so callers fall back gracefully.
     """
-    key = f'{side}:{model_path}'
-    if key not in _MANO_LAYERS:
+    if side in _MANO_LAYERS:
+        return _MANO_LAYERS[side]
+
+    if pkl_path is None:
+        # Default pkl path used by hamer
+        pkl_path = (Path('/scr/cezhao/workspace/HOI_recon/hamer/_DATA/data/mano')
+                    / f'MANO_{side.upper()}.pkl')
+
+    try:
         import smplx
-        model_path = Path(model_path)
-        layer = smplx.create(
-            str(model_path),
-            model_type='mano',
+        layer = smplx.MANOLayer(
+            str(pkl_path),
+            use_pca=True,
+            num_pca_comps=15,
             is_rhand=(side == 'right'),
-            use_pca=False,
             flat_hand_mean=True,
-            num_betas=10,
-            batch_size=1,
         )
         layer.eval()
-        _MANO_LAYERS[key] = layer
-    return _MANO_LAYERS[key]
+        _MANO_LAYERS[side] = layer
+    except Exception as e:
+        warnings.warn(f'Could not load smplx MANOLayer for {side}: {e}. FK disabled.')
+        _MANO_LAYERS[side] = None
+
+    return _MANO_LAYERS[side]
 
 
 @torch.no_grad()
 def mano_forward(
-    mano_params:  dict[str, np.ndarray],
-    side:         str,
-    model_path:   str | Path,
-    batch_size:   int = 64,
+    thetas:      np.ndarray,   # (T, 15)
+    wrist_xform: np.ndarray,   # (T, 6)
+    betas:       np.ndarray,   # (10,)
+    side:        str,
+    batch_size:  int = 64,
 ) -> dict[str, np.ndarray]:
-    """Run MANO forward kinematics over T frames.
-
-    Batches the T frames to avoid GPU OOM on long sequences.
+    """Run MANO FK over T frames using smplx.
 
     Args:
-        mano_params:  Output of build_mano_input (T frames).
-        side:         'left' or 'right'
-        model_path:   Path to MANO model directory.
-        batch_size:   Frames processed per forward pass.
+        thetas:      (T, 15) PCA pose coefficients from HOT3D
+        wrist_xform: (T, 6)  [global_orient (3) | transl (3)]
+        betas:       (10,)   shape parameters
+        side:        'left' or 'right'
+        batch_size:  frames per forward pass
     Returns:
-        dict with:
-            joints:   (T, 21, 3)  joint positions in world frame
-            vertices: (T, 778, 3) mesh vertices in world frame
+        {'joints': (T, 21, 3), 'vertices': (T, 778, 3)}
     """
-    layer = get_mano_layer(side, model_path)
+    layer = get_mano_layer(side)
+    if layer is None:
+        T = thetas.shape[0]
+        return {
+            'joints':   np.zeros((T, 21, 3),  dtype=np.float32),
+            'vertices': np.zeros((T, 778, 3), dtype=np.float32),
+        }
 
-    T            = mano_params['global_orient'].shape[0]
-    global_orient = torch.tensor(mano_params['global_orient'], dtype=torch.float32)  # (T, 3)
-    hand_pose     = torch.tensor(mano_params['hand_pose'],     dtype=torch.float32)  # (T, 45)
-    transl        = torch.tensor(mano_params['transl'],        dtype=torch.float32)  # (T, 3)
-    betas         = torch.tensor(mano_params['betas'],         dtype=torch.float32)  # (10,)
-    betas_batch   = betas.unsqueeze(0).expand(batch_size, -1)
+    T = thetas.shape[0]
+    go  = torch.tensor(wrist_xform[:, :3], dtype=torch.float32)
+    hp  = torch.tensor(thetas,             dtype=torch.float32)
+    tr  = torch.tensor(wrist_xform[:, 3:], dtype=torch.float32)
+    b   = torch.tensor(betas,             dtype=torch.float32)
 
     all_joints:   list[np.ndarray] = []
     all_vertices: list[np.ndarray] = []
 
-    for start in range(0, T, batch_size):
-        end  = min(start + batch_size, T)
-        B    = end - start
-        b_betas = betas.unsqueeze(0).expand(B, -1)
-
-        output = layer(
-            global_orient = global_orient[start:end],
-            hand_pose     = hand_pose[start:end],
-            transl        = transl[start:end],
-            betas         = b_betas,
+    for s in range(0, T, batch_size):
+        e   = min(s + batch_size, T)
+        B   = e - s
+        out = layer(
+            global_orient = go[s:e],
+            hand_pose     = hp[s:e],
+            transl        = tr[s:e],
+            betas         = b.unsqueeze(0).expand(B, -1),
             return_verts  = True,
         )
-        all_joints.append(output.joints.numpy())    # (B, 21, 3)
-        all_vertices.append(output.vertices.numpy())# (B, 778, 3)
+        all_joints.append(out.joints.numpy())
+        all_vertices.append(out.vertices.numpy())
 
     return {
-        'joints':   np.concatenate(all_joints,   axis=0),   # (T, 21, 3)
-        'vertices': np.concatenate(all_vertices, axis=0),   # (T, 778, 3)
+        'joints':   np.concatenate(all_joints,   axis=0),
+        'vertices': np.concatenate(all_vertices, axis=0),
     }
 
 
-# ---------------------------------------------------------------------------
-# Joint velocity
-# ---------------------------------------------------------------------------
-
 def compute_joint_velocity(joints: np.ndarray, dt: float = 1.0) -> np.ndarray:
-    """Finite-difference joint velocities.
-
-    Args:
-        joints: (T, J, 3) joint positions
-        dt:     Time step in seconds (HOT3D clips are ~3 fps after subsampling)
-    Returns:
-        (T, J, 3)  velocities; first frame is zero-padded
-    """
+    """Finite-difference joint velocities; first frame is zero-padded."""
     vel = np.zeros_like(joints)
     vel[1:] = (joints[1:] - joints[:-1]) / dt
     return vel
 
 
 # ---------------------------------------------------------------------------
-# Convenience: full hand feature vector H (31D per hand)
+# 31D per-hand feature vector
 # ---------------------------------------------------------------------------
 
 def build_hand_feature(
@@ -228,17 +200,10 @@ def build_hand_feature(
     wrist_xform: np.ndarray,  # (T, 6)
     betas:       np.ndarray,  # (10,)
 ) -> np.ndarray:
-    """Stack HOT3D hand annotations into the 31D per-hand feature used by WHOLE.
+    """Stack into the 31D per-hand feature used in the diffusion variable.
 
     Layout: [global_orient (3) | transl (3) | thetas (15) | betas (10)] = 31D
-
-    Args:
-        thetas:      (T, 15)
-        wrist_xform: (T, 6)   [global_orient (3) | transl (3)]
-        betas:       (10,)
-    Returns:
-        (T, 31) feature vectors
     """
     T = thetas.shape[0]
-    betas_rep = np.tile(betas, (T, 1))           # (T, 10)
-    return np.concatenate([wrist_xform, thetas, betas_rep], axis=-1)  # (T, 31)
+    betas_rep = np.tile(betas, (T, 1))
+    return np.concatenate([wrist_xform, thetas, betas_rep], axis=-1).astype(np.float32)
