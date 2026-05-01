@@ -158,9 +158,10 @@ class DDPM(nn.Module):
         else:
             mse = err.mean()
 
-        # Variance schedule weighting w_n (B,) → scalar via mean
-        w_n = self.loss_weight[t].mean()
-        loss_ddpm = w_n * mse
+        # Simplified objective (w_n = 1): standard practice for motion diffusion
+        # models (MDM, GRIP, etc.). The variance-weighted VLB objective causes
+        # instability because w_n = 1/(1-ᾱ_n) → ∞ for small t.
+        loss_ddpm = mse
 
         return {
             'loss_ddpm': loss_ddpm,
