@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# 数据（存在 _DATA/ 目录，不纳入 git）
+data/
+*.tar
+*.zip
+*.hdf5
+*.h5
+*.pkl
+*.npy
+*.npz
+
+# 模型权重与 checkpoints
+checkpoints/
+outputs/
+runs/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+
+# 日志
+logs/
+wandb/
+tensorboard/
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 环境
+.env
+.venv/
+env/
+
+# 临时文件
+tmp/
+temp/
+*.tmp
