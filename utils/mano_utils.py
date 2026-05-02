@@ -138,19 +138,14 @@ def fk_from_x0(
     betas = p[f'{prefix}_betas'].mean(dim=1)      # (B, 10)
     betas = betas.unsqueeze(1).expand(-1, T, -1).reshape(B * T, 10)
 
-    CHUNK = 64
-    all_joints = []
     fingertip_idx = torch.tensor([744, 320, 443, 554, 671],
                                   device=device, dtype=torch.long)
 
     with torch.no_grad():
-        for s in range(0, B * T, CHUNK):
-            e   = min(s + CHUNK, B * T)
-            out = layer(global_orient=go[s:e], hand_pose=hp[s:e],
-                        transl=tr[s:e], betas=betas[s:e], return_verts=True)
-            tips = out.vertices[:, fingertip_idx, :]          # (chunk, 5, 3)
-            j21  = torch.cat([out.joints, tips], dim=1)       # (chunk, 21, 3)
-            all_joints.append(j21)
+        out  = layer(global_orient=go, hand_pose=hp,
+                     transl=tr, betas=betas, return_verts=True)
+        tips = out.vertices[:, fingertip_idx, :]          # (B*T, 5, 3)
+        j21  = torch.cat([out.joints, tips], dim=1)       # (B*T, 21, 3)
 
-    joints = torch.cat(all_joints, dim=0).reshape(B, T, 21, 3)
+    joints = j21.reshape(B, T, 21, 3)
     return joints

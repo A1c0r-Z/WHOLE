@@ -36,9 +36,9 @@ diffusion:
   beta_max:     0.02
 
 training:
-  batch_size:     32
+  batch_size:     256
   num_workers:    8
-  lr:             2.0e-4
+  lr:             5.0e-4
   optimizer:      adamw
   weight_decay:   1.0e-4
   max_iters:      1_000_000

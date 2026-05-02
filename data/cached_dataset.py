@@ -75,9 +75,14 @@ class CachedHOT3DDataset(Dataset):
                     self._index.append((npz, i * stride))
                 n_clips += 1
 
-        # LRU clip cache (avoid re-loading the same npz for consecutive windows)
+        # Pre-load all npz files into RAM (351 MB compressed → ~1 GB decompressed).
+        # Eliminates all disk I/O during training, removing the DataLoader bottleneck.
+        unique_npzs = sorted({str(p) for p, _ in self._index})
         self._cache: dict[str, dict] = {}
-        self._cache_max = 64
+        self._cache_max = len(unique_npzs) + 1   # never evict
+        for path in unique_npzs:
+            raw = np.load(path, allow_pickle=True)
+            self._cache[path] = dict(raw)
 
     def __len__(self) -> int:
         return len(self._index)

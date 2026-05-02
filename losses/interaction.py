@@ -24,23 +24,28 @@ from utils.mano_utils import fk_from_x0, get_obj_transform, apply_obj_transform,
 
 def _nearest_obj_point(
     joints:    torch.Tensor,   # (B, T, J, 3)
-    obj_verts: torch.Tensor,   # (B, T, V, 3)
+    obj_verts: torch.Tensor,   # (B, T, V, 3)  V is pre-decimated to ~2k
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """For each joint, find nearest object vertex.
 
+    Assumes V is small (templates are pre-decimated at load time).
+    Index selection is non-differentiable (argmin ≈ 0 gradient) so we run
+    it under no_grad; gradients flow via the final gather into obj_verts.
+
     Returns:
-        nn_verts: (B, T, J, 3)  nearest vertex positions
+        nn_verts: (B, T, J, 3)  nearest vertex positions (with grad)
         nn_idx:   (B, T, J)     indices into V dim
     """
-    # (B, T, J, V)
-    diff  = obj_verts.unsqueeze(2) - joints.unsqueeze(3)
-    sq_d  = (diff ** 2).sum(-1)
-    nn_idx = sq_d.argmin(-1)                          # (B, T, J)
+    B, T, J, _ = joints.shape
 
-    idx_exp = nn_idx[..., None, None].expand(*nn_idx.shape, 1, 3)
-    nn_verts = obj_verts.unsqueeze(2).expand(
-        *obj_verts.shape[:2], joints.shape[2], *obj_verts.shape[2:]
-    ).gather(3, idx_exp).squeeze(3)                   # (B, T, J, 3)
+    with torch.no_grad():
+        diff   = obj_verts.detach().unsqueeze(2) - joints.detach().unsqueeze(3)
+        sq_d   = (diff ** 2).sum(-1)      # (B, T, J, V)
+        nn_idx = sq_d.argmin(-1)          # (B, T, J)
+
+    b_idx    = torch.arange(B, device=joints.device).view(B, 1, 1).expand(B, T, J)
+    t_idx    = torch.arange(T, device=joints.device).view(1, T, 1).expand(B, T, J)
+    nn_verts = obj_verts[b_idx, t_idx, nn_idx]   # (B, T, J, 3) — grad flows here
     return nn_verts, nn_idx
 
 
@@ -49,18 +54,12 @@ def loss_interaction(
     template_verts: torch.Tensor,       # (V, 3) canonical object vertices
     contact_gt:     torch.Tensor | None = None,  # (B, T, 2) or None → use predicted
     frame_valid:    torch.Tensor | None = None,  # (B, T) bool
+    pred_joints:    tuple | None = None,          # precomputed (left, right) (B,T,21,3)
 ) -> torch.Tensor:
     """Compute L_inter = contact_distance + near_rigid_transport.
 
     Falls back to a wrist-proximity version when MANO FK is unavailable.
-
-    Args:
-        x0_pred:        predicted clean trajectory (B, T, 73)
-        template_verts: canonical object mesh vertices (V, 3)
-        contact_gt:     GT contact labels (B, T, 2); if None, uses x0_pred
-        frame_valid:    validity mask (B, T)
-    Returns:
-        scalar interaction loss
+    pred_joints: pass precomputed FK to avoid redundant smplx calls.
     """
     # ---- object world vertices ----
     T_obj     = get_obj_transform(x0_pred)                    # (B, T, 4, 4)
@@ -73,8 +72,11 @@ def loss_interaction(
         contact = x0_pred[..., 9:11].sigmoid()   # (B, T, 2) soft labels
 
     # ---- hand joints ----
-    left_j  = fk_from_x0(x0_pred, 'left')    # (B, T, 21, 3) or None
-    right_j = fk_from_x0(x0_pred, 'right')
+    if pred_joints is not None:
+        left_j, right_j = pred_joints
+    else:
+        left_j  = fk_from_x0(x0_pred, 'left')
+        right_j = fk_from_x0(x0_pred, 'right')
 
     if left_j is None or right_j is None:
         return _wrist_interaction(x0_pred, obj_verts, contact, frame_valid)

@@ -20,31 +20,28 @@ from utils.mano_utils import fk_from_x0, unpack_x0
 
 
 def loss_consistency(
-    x0_pred:     torch.Tensor,              # (B, T, 73) predicted
-    x0_gt:       torch.Tensor,              # (B, T, 73) ground truth
-    frame_valid: torch.Tensor | None = None,  # (B, T) bool
+    x0_pred:     torch.Tensor,                       # (B, T, 73) predicted
+    x0_gt:       torch.Tensor,                       # (B, T, 73) ground truth
+    frame_valid: torch.Tensor | None = None,          # (B, T) bool
+    pred_joints: tuple | None = None,                 # precomputed (left, right) (B,T,21,3)
+    gt_joints:   tuple | None = None,                 # precomputed (left, right) (B,T,21,3)
 ) -> torch.Tensor:
     """Joint-space consistency loss between predicted and GT MANO FK.
 
-    Tries full 21-joint FK first; falls back to wrist-only if MANO is
-    unavailable.
-
-    Args:
-        x0_pred:     predicted clean trajectory
-        x0_gt:       ground-truth clean trajectory
-        frame_valid: optional validity mask
-    Returns:
-        scalar loss
+    pred_joints / gt_joints: pass precomputed FK results to avoid redundant
+    smplx calls when this loss shares FK with loss_interaction.
     """
-    left_pred  = fk_from_x0(x0_pred, 'left')
-    right_pred = fk_from_x0(x0_pred, 'right')
+    left_pred  = pred_joints[0] if pred_joints is not None else fk_from_x0(x0_pred, 'left')
+    right_pred = pred_joints[1] if pred_joints is not None else fk_from_x0(x0_pred, 'right')
 
     if left_pred is None or right_pred is None:
-        # MANO unavailable — fall back to wrist translation only
         return _wrist_consistency(x0_pred, x0_gt, frame_valid)
 
-    left_gt   = fk_from_x0(x0_gt,   'left')
-    right_gt  = fk_from_x0(x0_gt,   'right')
+    if gt_joints is not None:
+        left_gt, right_gt = gt_joints
+    else:
+        left_gt  = fk_from_x0(x0_gt, 'left')
+        right_gt = fk_from_x0(x0_gt, 'right')
 
     return _joint_consistency(
         torch.cat([left_pred, right_pred], dim=2),   # (B, T, 42, 3)

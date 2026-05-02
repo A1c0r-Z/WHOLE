@@ -33,6 +33,7 @@ from data.hot3d_loader import HOT3DDataset, collate_fn
 from data.preprocessing import preprocess_window
 from models import build_denoiser, build_diffusion, ObjectBPSCache
 from losses import loss_smooth, loss_consistency, loss_interaction
+from utils.mano_utils import fk_from_x0
 import trimesh
 import numpy as np
 
@@ -50,6 +51,16 @@ def is_main() -> bool:
     return not dist.is_initialized() or dist.get_rank() == 0
 
 
+def unwrap(model: nn.Module) -> nn.Module:
+    """Strip DDP and torch.compile wrappers to reach the raw module."""
+    m = model
+    if hasattr(m, 'module'):    # DistributedDataParallel
+        m = m.module
+    if hasattr(m, '_orig_mod'): # torch.compile OptimizedModule
+        m = m._orig_mod
+    return m
+
+
 def log(msg: str):
     if is_main():
         print(f'[{time.strftime("%H:%M:%S")}] {msg}', flush=True)
@@ -63,13 +74,19 @@ def get_lr(step: int, warmup: int, max_lr: float, total: int) -> float:
     return max_lr * 0.5 * (1 + math.cos(math.pi * progress))
 
 
+_TEMPLATE_TARGET_VERTS = 2000   # enough for contact-distance loss; avoids huge (B,T,J,V,3) tensors
+
 def load_object_template(models_dir: str, bop_id: str) -> torch.Tensor | None:
-    """Load canonical object mesh vertices for a given BOP ID."""
+    """Load canonical object mesh vertices, decimated to _TEMPLATE_TARGET_VERTS."""
     glb = Path(models_dir) / f'obj_{int(bop_id):06d}.glb'
     if not glb.exists():
         return None
     mesh = trimesh.load(str(glb), force='mesh')
-    verts = torch.tensor(np.array(mesh.vertices), dtype=torch.float32)
+    if len(mesh.vertices) > _TEMPLATE_TARGET_VERTS:
+        pts, _ = trimesh.sample.sample_surface_even(mesh, _TEMPLATE_TARGET_VERTS)
+        verts = torch.tensor(pts, dtype=torch.float32)
+    else:
+        verts = torch.tensor(np.array(mesh.vertices), dtype=torch.float32)
     center = verts.mean(0)
     scale  = (verts - center).norm(dim=1).max().clamp(min=1e-6)
     return (verts - center) / scale
@@ -189,16 +206,32 @@ def training_step(
     # ---- Auxiliary losses (after curriculum warm-up) ----
     aux_start = cfg['training']['aux_loss_start']
     if step >= aux_start:
-        x0_pred = out['x0_pred'].detach()   # detach for auxiliary: no double backprop
+        x0_pred = out['x0_pred']   # keep graph: gradients from aux losses train the model
 
         losses['loss_smooth'] = loss_smooth(x0_pred, frame_valid)
-        losses['loss_const']  = loss_consistency(x0_pred, x0, frame_valid)
 
-        # Interaction loss needs the object template mesh
+        # --- FK on x0_pred: compute ONCE, share across both losses ---
+        # (was 6 separate smplx calls; now 2)
+        pred_left_j  = fk_from_x0(x0_pred, 'left')
+        pred_right_j = fk_from_x0(x0_pred, 'right')
+        pred_joints  = (pred_left_j, pred_right_j)
+
+        # GT joints come from the pre-computed cache (no FK needed)
+        gt_left_j  = batch.get('left_joints')
+        gt_right_j = batch.get('right_joints')
+        if gt_left_j is not None and gt_right_j is not None:
+            gt_joints = (gt_left_j.to(device), gt_right_j.to(device))
+        else:
+            gt_joints = None   # falls back to fk(x0_gt) inside the loss
+
+        losses['loss_const'] = loss_consistency(
+            x0_pred, x0, frame_valid,
+            pred_joints=pred_joints, gt_joints=gt_joints,
+        )
+
+        # Interaction loss — use the same pred FK
         bop_ids = batch['obj_bop_id']
-        # Use the most common BOP ID in the batch as the template
-        # (in practice batches often share the same object for HOT3D clips)
-        bop_id = bop_ids[0] if isinstance(bop_ids, list) else bop_ids
+        bop_id  = bop_ids[0] if isinstance(bop_ids, list) else bop_ids
         if bop_id not in obj_template_cache:
             verts = load_object_template(cfg['data']['object_models_dir'], bop_id)
             obj_template_cache[bop_id] = verts
@@ -207,7 +240,8 @@ def training_step(
         if template_verts is not None:
             template_verts = template_verts.to(device)
             losses['loss_inter'] = loss_interaction(
-                x0_pred, template_verts, frame_valid=frame_valid
+                x0_pred, template_verts, frame_valid=frame_valid,
+                pred_joints=pred_joints,
             )
         else:
             losses['loss_inter'] = x0_pred.new_zeros(())
@@ -282,14 +316,17 @@ def main():
 
     sampler = DistributedSampler(train_ds, shuffle=True) if dist.is_initialized() else None
     batch_size = 2 if args.debug else tc['batch_size']
+    n_workers = 0 if args.debug else tc['num_workers']
     loader = DataLoader(
         train_ds,
-        batch_size  = batch_size,
-        sampler     = sampler,
-        shuffle     = (sampler is None),
-        num_workers = 0 if args.debug else tc['num_workers'],
-        pin_memory  = True,
-        drop_last   = True,
+        batch_size       = batch_size,
+        sampler          = sampler,
+        shuffle          = (sampler is None),
+        num_workers      = n_workers,
+        pin_memory       = True,
+        drop_last        = True,
+        persistent_workers = (n_workers > 0),   # keep workers alive between steps
+        prefetch_factor  = 4 if n_workers > 0 else None,
     )
     log(f'Dataset: {len(train_ds)} windows | batch {batch_size} | '
         f'{len(loader)} steps/epoch')
@@ -298,8 +335,7 @@ def main():
     start_step = 0
     if args.resume and Path(args.resume).exists():
         ckpt = torch.load(args.resume, map_location=device)
-        (denoiser.module if dist.is_initialized() else denoiser).load_state_dict(
-            ckpt['model'])
+        unwrap(denoiser).load_state_dict(ckpt['model'])
         optimizer.load_state_dict(ckpt['optimizer'])
         start_step = ckpt['step'] + 1
         log(f'Resumed from step {start_step}')
@@ -308,8 +344,20 @@ def main():
     if is_main():
         out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- Training loop ----
+    # ---- Pre-warm object template cache (one-time surface sampling per object) ----
     obj_template_cache: dict = {}
+    if is_main():
+        models_dir = cfg['data']['object_models_dir']
+        glbs = sorted(Path(models_dir).glob('obj_*.glb'))
+        log(f'Pre-loading {len(glbs)} object templates...')
+        for glb in glbs:
+            bop_id = str(int(glb.stem.split('_')[1]))
+            verts = load_object_template(models_dir, bop_id)
+            if verts is not None:
+                obj_template_cache[bop_id] = verts
+        log(f'Object templates cached: {len(obj_template_cache)}')
+
+    # ---- Training loop ----
     data_iter  = iter(loader)
     step       = start_step
     max_steps  = tc['max_iters']
@@ -362,7 +410,7 @@ def main():
 
         # Checkpointing
         if step % save_every == 0 and step > start_step and is_main():
-            m = denoiser.module if dist.is_initialized() else denoiser
+            m = unwrap(denoiser)
             ckpt_path = out_dir / f'ckpt_{step:07d}.pt'
             torch.save({
                 'step':      step,
@@ -371,6 +419,20 @@ def main():
                 'cfg':       cfg,
             }, ckpt_path)
             log(f'Saved checkpoint: {ckpt_path}')
+
+        # Safety checkpoint one step before aux losses kick in — ensures a clean
+        # DDPM-only model is always recoverable if the first aux-loss step OOMs.
+        aux_start = cfg['training']['aux_loss_start']
+        if step == aux_start - 1 and is_main():
+            m = unwrap(denoiser)
+            ckpt_path = out_dir / f'ckpt_pre_aux_{step:07d}.pt'
+            torch.save({
+                'step':      step,
+                'model':     m.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'cfg':       cfg,
+            }, ckpt_path)
+            log(f'Pre-aux safety checkpoint: {ckpt_path}')
 
         step += 1
 
