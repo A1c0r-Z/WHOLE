@@ -114,14 +114,39 @@ class PreprocessedDataset(torch.utils.data.Dataset):
         }
 
 
-def build_datasets(cfg: dict) -> tuple[PreprocessedDataset, ...]:
+def build_datasets(cfg: dict, use_cache: bool = False) -> ConcatDataset:
     d = cfg['data']
-    train_dirs = [d['train_aria_dir'], d['train_quest3_dir']]
-    datasets = []
-    for td in train_dirs:
-        if Path(td).exists():
-            datasets.append(PreprocessedDataset(td, cfg, augment=True))
-            log(f'  Loaded train split: {td}  ({len(datasets[-1])} windows)')
+
+    if use_cache:
+        from data.cached_dataset import CachedHOT3DDataset
+        cache_dirs = [d.get('cache_aria_dir', ''), d.get('cache_quest3_dir', '')]
+        cache_dirs = [c for c in cache_dirs if c and Path(c).exists()]
+        if not cache_dirs:
+            raise RuntimeError(
+                'Cache dirs not found. Run scripts/preprocess_cache.py first, '
+                'then set cache_aria_dir / cache_quest3_dir in config.'
+            )
+        datasets = []
+        for cd in cache_dirs:
+            ds = CachedHOT3DDataset(
+                cache_dirs        = [cd],
+                object_models_dir = d['object_models_dir'],
+                bps_n_points      = cfg['model']['bps_n_points'],
+                bps_radius        = cfg['model']['bps_radius'],
+                window_len        = d['window_len'],
+                stride            = d['stride'],
+                augment           = True,
+            )
+            datasets.append(ds)
+            log(f'  Loaded cache: {cd}  ({len(ds)} windows)')
+    else:
+        train_dirs = [d['train_aria_dir'], d['train_quest3_dir']]
+        datasets = []
+        for td in train_dirs:
+            if Path(td).exists():
+                datasets.append(PreprocessedDataset(td, cfg, augment=True))
+                log(f'  Loaded train split: {td}  ({len(datasets[-1])} windows)')
+
     if not datasets:
         raise RuntimeError('No training data found — check config paths')
     return ConcatDataset(datasets)
@@ -206,8 +231,10 @@ def training_step(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default='configs/default.yaml')
-    parser.add_argument('--debug',  action='store_true',
+    parser.add_argument('--debug',     action='store_true',
                         help='Run 200 steps with batch_size=2 for smoke test')
+    parser.add_argument('--use_cache', action='store_true',
+                        help='Use pre-computed .npz cache (fast) instead of raw tars')
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume from')
     args = parser.parse_args()
@@ -251,7 +278,7 @@ def main():
 
     # ---- Data ----
     log('Building datasets...')
-    train_ds = build_datasets(cfg)
+    train_ds = build_datasets(cfg, use_cache=args.use_cache)
 
     sampler = DistributedSampler(train_ds, shuffle=True) if dist.is_initialized() else None
     batch_size = 2 if args.debug else tc['batch_size']

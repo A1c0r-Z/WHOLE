@@ -1,6 +1,8 @@
 data:
   train_aria_dir:   /scr/cezhao/workspace/HOI_recon/_DATA/hot3d/train_aria
   train_quest3_dir: /scr/cezhao/workspace/HOI_recon/_DATA/hot3d/train_quest3
+  cache_aria_dir:   /scr/cezhao/workspace/HOI_recon/_DATA/cache/train_aria
+  cache_quest3_dir: /scr/cezhao/workspace/HOI_recon/_DATA/cache/train_quest3
   test_aria_dir:    /scr/cezhao/workspace/HOI_recon/_DATA/hot3d/test_aria
   test_quest3_dir:  /scr/cezhao/workspace/HOI_recon/_DATA/hot3d/test_quest3
   object_models_dir: /scr/cezhao/workspace/HOI_recon/_DATA/hot3d/object_models
